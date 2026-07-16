@@ -16,18 +16,22 @@ import {
   PROFILING_FLAG_PERFORMANCE_TRACKS_SUPPORT,
   TREE_OPERATION_ADD,
   TREE_OPERATION_REMOVE,
-  TREE_OPERATION_REMOVE_ROOT,
   TREE_OPERATION_REORDER_CHILDREN,
   TREE_OPERATION_SET_SUBTREE_MODE,
   TREE_OPERATION_UPDATE_ERRORS_OR_WARNINGS,
   TREE_OPERATION_UPDATE_TREE_BASE_DURATION,
+  TREE_OPERATION_APPLIED_ACTIVITY_SLICE_CHANGE,
   SUSPENSE_TREE_OPERATION_ADD,
   SUSPENSE_TREE_OPERATION_REMOVE,
   SUSPENSE_TREE_OPERATION_REORDER_CHILDREN,
   SUSPENSE_TREE_OPERATION_RESIZE,
   SUSPENSE_TREE_OPERATION_SUSPENDERS,
 } from '../constants';
-import {ElementTypeRoot} from '../frontend/types';
+import {
+  ElementTypeRoot,
+  ElementTypeActivity,
+  ComponentFilterActivitySlice,
+} from '../frontend/types';
 import {
   getSavedComponentFilters,
   setSavedComponentFilters,
@@ -44,7 +48,11 @@ import {
   BRIDGE_PROTOCOL,
   currentBridgeProtocol,
 } from 'react-devtools-shared/src/bridge';
-import {StrictMode} from 'react-devtools-shared/src/frontend/types';
+import {
+  StrictMode,
+  ActivityHiddenMode,
+  ActivityVisibleMode,
+} from 'react-devtools-shared/src/frontend/types';
 import {withPermissionsCheck} from 'react-devtools-shared/src/frontend/utils/withPermissionsCheck';
 
 import type {
@@ -88,6 +96,7 @@ class RectRBush extends RBush<Rect> {
 }
 
 const debug = (methodName: string, ...args: Array<string>) => {
+  // $FlowFixMe[constant-condition]
   if (__DEBUG__) {
     console.log(
       `%cStore %c${methodName}`,
@@ -139,12 +148,17 @@ export default class Store extends EventEmitter<{
   backendVersion: [],
   collapseNodesByDefault: [],
   componentFilters: [],
-  enableSuspenseTab: [],
   error: [Error],
   hookSettings: [$ReadOnly<DevToolsHookSettings>],
-  hostInstanceSelected: [Element['id']],
-  settingsUpdated: [$ReadOnly<DevToolsHookSettings>],
-  mutated: [[Array<Element['id']>, Map<Element['id'], Element['id']>]],
+  hostInstanceSelected: [Element['id'] | null],
+  settingsUpdated: [$ReadOnly<DevToolsHookSettings>, Array<ComponentFilter>],
+  mutated: [
+    [
+      Array<Element['id']>,
+      Map<Element['id'], Element['id']>,
+      Element['id'] | null,
+    ],
+  ],
   recordChangeDescriptions: [],
   roots: [],
   rootSupportsBasicProfiling: [],
@@ -177,6 +191,8 @@ export default class Store extends EventEmitter<{
     Element['id'],
     {errorCount: number, warningCount: number},
   > = new Map();
+
+  _focusedTransition: 0 | Element['id'] = 0;
 
   // At least one of the injected renderers contains (DEV only) owner metadata.
   _hasOwnerMetadata: boolean = false;
@@ -227,8 +243,6 @@ export default class Store extends EventEmitter<{
   _supportsClickToInspect: boolean = false;
   _supportsTimeline: boolean = false;
   _supportsTraceUpdates: boolean = false;
-  // Dynamically set if the renderer supports the Suspense tab.
-  _supportsSuspenseTab: boolean = false;
 
   _isReloadAndProfileFrontendSupported: boolean = false;
   _isReloadAndProfileBackendSupported: boolean = false;
@@ -260,6 +274,7 @@ export default class Store extends EventEmitter<{
   constructor(bridge: FrontendBridge, config?: Config) {
     super();
 
+    // $FlowFixMe[constant-condition]
     if (__DEBUG__) {
       debug('constructor', 'subscribing to Bridge');
     }
@@ -308,10 +323,6 @@ export default class Store extends EventEmitter<{
 
     this._bridge = bridge;
     bridge.addListener('operations', this.onBridgeOperations);
-    bridge.addListener(
-      'overrideComponentFilters',
-      this.onBridgeOverrideComponentFilters,
-    );
     bridge.addListener('shutdown', this.onBridgeShutdown);
     bridge.addListener(
       'isReloadAndProfileSupportedByBackend',
@@ -333,7 +344,6 @@ export default class Store extends EventEmitter<{
     bridge.addListener('hookSettings', this.onHookSettings);
     bridge.addListener('backendInitialized', this.onBackendInitialized);
     bridge.addListener('selectElement', this.onHostInstanceSelected);
-    bridge.addListener('enableSuspenseTab', this.onEnableSuspenseTab);
   }
 
   // This is only used in tests to avoid memory leaks.
@@ -424,8 +434,23 @@ export default class Store extends EventEmitter<{
 
     this._componentFilters = value;
 
-    // Update persisted filter preferences stored in localStorage.
+    // Update persisted filter preferences
     setSavedComponentFilters(value);
+    if (this._hookSettings === null) {
+      // We changed filters before we got the hook settings.
+      // Wait for hook settings before persisting component filters to not overwrite
+      // persisted hook settings with defaults.
+      // This exists purely as a type safety check; in practice the hook settings
+      // should have arrived before any filter changes could be made.
+      const onHookSettings = (settings: $ReadOnly<DevToolsHookSettings>) => {
+        this._bridge.removeListener('hookSettings', onHookSettings);
+        this.emit('settingsUpdated', settings, value);
+      };
+      this._bridge.addListener('hookSettings', onHookSettings);
+      this._bridge.send('getHookSettings');
+    } else {
+      this.emit('settingsUpdated', this._hookSettings, value);
+    }
 
     // Notify the renderer that filter preferences have changed.
     // This is an expensive operation; it unmounts and remounts the entire tree,
@@ -583,6 +608,7 @@ export default class Store extends EventEmitter<{
       root = this._idToElement.get(rootID);
 
       if (root === undefined) {
+        // We should never reach this. This is a bug in the backend renderer.
         this._throwAndEmitError(
           Error(
             `Couldn't find root with id "${rootID}": no matching node was found in the Store.`,
@@ -619,6 +645,7 @@ export default class Store extends EventEmitter<{
         const child = this._idToElement.get(childID);
 
         if (child === undefined) {
+          // We should never reach this. This is a bug in the backend renderer.
           this._throwAndEmitError(
             Error(
               `Couldn't child element with id "${childID}": no matching node was found in the Store.`,
@@ -656,6 +683,10 @@ export default class Store extends EventEmitter<{
     }
 
     return element;
+  }
+
+  containsSuspense(id: SuspenseNode['id']): boolean {
+    return this._idToSuspense.has(id);
   }
 
   getSuspenseByID(id: SuspenseNode['id']): SuspenseNode | null {
@@ -920,12 +951,11 @@ export default class Store extends EventEmitter<{
   }
 
   /**
-   * @param rootID
    * @param uniqueSuspendersOnly Filters out boundaries without unique suspenders
    */
-  getSuspendableDocumentOrderSuspense(
+  getSuspendableDocumentOrderSuspenseInitialPaint(
     uniqueSuspendersOnly: boolean,
-  ): $ReadOnlyArray<SuspenseTimelineStep> {
+  ): Array<SuspenseTimelineStep> {
     const target: Array<SuspenseTimelineStep> = [];
     const roots = this.roots;
     let rootStep: null | SuspenseTimelineStep = null;
@@ -934,6 +964,12 @@ export default class Store extends EventEmitter<{
       const root = this.getElementByID(rootID);
       if (root === null) {
         continue;
+      }
+      const rendererID = this._rootIDToRendererID.get(rootID);
+      if (rendererID === undefined) {
+        throw new Error(
+          'Failed to find renderer ID for root. This is a bug in React DevTools.',
+        );
       }
       // TODO: This includes boundaries that can't be suspended due to no support from the renderer.
 
@@ -949,20 +985,104 @@ export default class Store extends EventEmitter<{
           rootStep = {
             id: suspense.id,
             environment: environmentName,
+            endTime: suspense.endTime,
+            rendererID,
           };
           target.push(rootStep);
-        } else if (rootStep.environment === null) {
-          // If any root has an environment name, then let's use it.
-          rootStep.environment = environmentName;
+        } else {
+          if (rootStep.environment === null) {
+            // If any root has an environment name, then let's use it.
+            rootStep.environment = environmentName;
+          }
+          if (suspense.endTime > rootStep.endTime) {
+            // If any root has a higher end time, let's use that.
+            rootStep.endTime = suspense.endTime;
+          }
         }
         this.pushTimelineStepsInDocumentOrder(
           suspense.children,
           target,
           uniqueSuspendersOnly,
           environments,
+          0, // Don't pass a minimum end time at the root. The root is always first so doesn't matter.
+          rendererID,
         );
       }
     }
+
+    return target;
+  }
+
+  _pushSuspenseChildrenInDocumentOrder(
+    children: Array<Element['id']>,
+    target: Array<SuspenseNode['id']>,
+  ): void {
+    for (let i = 0; i < children.length; i++) {
+      const childID = children[i];
+      const suspense = this._idToSuspense.get(childID);
+      if (suspense !== undefined) {
+        target.push(suspense.id);
+      } else {
+        const childElement = this._idToElement.get(childID);
+        if (childElement !== undefined) {
+          this._pushSuspenseChildrenInDocumentOrder(
+            childElement.children,
+            target,
+          );
+        }
+      }
+    }
+  }
+
+  getSuspenseChildren(id: Element['id']): Array<SuspenseNode['id']> {
+    const transitionChildren: Array<SuspenseNode['id']> = [];
+
+    const root = this._idToElement.get(id);
+    if (root === undefined) {
+      return transitionChildren;
+    }
+
+    this._pushSuspenseChildrenInDocumentOrder(
+      root.children,
+      transitionChildren,
+    );
+
+    return transitionChildren;
+  }
+
+  /**
+   * @param uniqueSuspendersOnly Filters out boundaries without unique suspenders
+   */
+  getSuspendableDocumentOrderSuspenseTransition(
+    uniqueSuspendersOnly: boolean,
+    rendererID: number,
+  ): Array<SuspenseTimelineStep> {
+    const target: Array<SuspenseTimelineStep> = [];
+    const focusedTransitionID = this._focusedTransition;
+    // $FlowFixMe[invalid-compare]
+    if (focusedTransitionID === null) {
+      return target;
+    }
+
+    target.push({
+      id: focusedTransitionID,
+      // TODO: Get environment for Activity
+      environment: null,
+      endTime: 0,
+      rendererID,
+    });
+
+    const transitionChildren = this.getSuspenseChildren(focusedTransitionID);
+
+    this.pushTimelineStepsInDocumentOrder(
+      transitionChildren,
+      target,
+      uniqueSuspendersOnly,
+      // TODO: Get environment for Activity
+      [],
+      0, // Don't pass a minimum end time at the root. The root is always first so doesn't matter.
+      rendererID,
+    );
 
     return target;
   }
@@ -972,6 +1092,8 @@ export default class Store extends EventEmitter<{
     target: Array<SuspenseTimelineStep>,
     uniqueSuspendersOnly: boolean,
     parentEnvironments: Array<string>,
+    parentEndTime: number,
+    rendererID: number,
   ): void {
     for (let i = 0; i < children.length; i++) {
       const child = this.getSuspenseByID(children[i]);
@@ -996,10 +1118,16 @@ export default class Store extends EventEmitter<{
         unionEnvironments.length > 0
           ? unionEnvironments[unionEnvironments.length - 1]
           : null;
+      // The end time of a child boundary can in effect never be earlier than its parent even if
+      // everything unsuspended before that.
+      const maxEndTime =
+        parentEndTime > child.endTime ? parentEndTime : child.endTime;
       if (hasRects && (!uniqueSuspendersOnly || child.hasUniqueSuspenders)) {
         target.push({
           id: child.id,
           environment: environmentName,
+          endTime: maxEndTime,
+          rendererID,
         });
       }
       this.pushTimelineStepsInDocumentOrder(
@@ -1007,7 +1135,78 @@ export default class Store extends EventEmitter<{
         target,
         uniqueSuspendersOnly,
         unionEnvironments,
+        maxEndTime,
+        rendererID,
       );
+    }
+  }
+
+  getEndTimeOrDocumentOrderSuspense(
+    uniqueSuspendersOnly: boolean,
+  ): $ReadOnlyArray<SuspenseTimelineStep> {
+    let timeline: SuspenseTimelineStep[];
+    if (this._focusedTransition === 0) {
+      timeline =
+        this.getSuspendableDocumentOrderSuspenseInitialPaint(
+          uniqueSuspendersOnly,
+        );
+    } else {
+      const focusedTransitionRootID = this.getRootIDForElement(
+        this._focusedTransition,
+      );
+      if (focusedTransitionRootID === null) {
+        throw new Error(
+          'Failed to find root ID for focused transition. This is a bug in React DevTools.',
+        );
+      }
+      const rendererID = this._rootIDToRendererID.get(focusedTransitionRootID);
+      if (rendererID === undefined) {
+        throw new Error(
+          'Failed to find renderer ID for focused transition root. This is a bug in React DevTools.',
+        );
+      }
+      timeline = this.getSuspendableDocumentOrderSuspenseTransition(
+        uniqueSuspendersOnly,
+        rendererID,
+      );
+    }
+
+    if (timeline.length === 0) {
+      return timeline;
+    }
+    const root = timeline[0];
+    // We mutate in place since we assume we've got a fresh array.
+    timeline.sort((a, b) => {
+      // Root is always first
+      return a === root ? -1 : b === root ? 1 : a.endTime - b.endTime;
+    });
+    return timeline;
+  }
+
+  getActivities(): Array<{id: Element['id'], depth: number}> {
+    const target: Array<{id: Element['id'], depth: number}> = [];
+    // TODO: Keep a live tree in the backend so we don't need to recalculate
+    // this each time while also including filtered Activities.
+    this._pushActivitiesInDocumentOrder(this.roots, target, 0);
+    return target;
+  }
+
+  _pushActivitiesInDocumentOrder(
+    children: $ReadOnlyArray<Element['id']>,
+    target: Array<{id: Element['id'], depth: number}>,
+    depth: number,
+  ): void {
+    for (let i = 0; i < children.length; i++) {
+      const child = this._idToElement.get(children[i]);
+      if (child === undefined) {
+        continue;
+      }
+      if (child.type === ElementTypeActivity && child.nameProp !== null) {
+        target.push({id: child.id, depth});
+        this._pushActivitiesInDocumentOrder(child.children, target, depth + 1);
+      } else {
+        this._pushActivitiesInDocumentOrder(child.children, target, depth);
+      }
     }
   }
 
@@ -1116,7 +1315,7 @@ export default class Store extends EventEmitter<{
       if (didMutate) {
         let weightAcrossRoots = 0;
         this._roots.forEach(rootID => {
-          const {weight} = ((this.getElementByID(rootID): any): Element);
+          const {weight} = this.getElementByID(rootID) as any as Element;
           weightAcrossRoots += weight;
         });
         this._weightAcrossRoots = weightAcrossRoots;
@@ -1124,7 +1323,7 @@ export default class Store extends EventEmitter<{
         // The Tree context's search reducer expects an explicit list of ids for nodes that were added or removed.
         // In this  case, we can pass it empty arrays since nodes in a collapsed tree are still there (just hidden).
         // Updating the selected search index later may require auto-expanding a collapsed subtree though.
-        this.emit('mutated', [[], new Map()]);
+        this.emit('mutated', [[], new Map(), null]);
       }
     }
   }
@@ -1179,6 +1378,7 @@ export default class Store extends EventEmitter<{
   };
 
   onBridgeOperations: (operations: Array<number>) => void = operations => {
+    // $FlowFixMe[constant-condition]
     if (__DEBUG__) {
       console.groupCollapsed('onBridgeOperations');
       debug('onBridgeOperations', operations.join(','));
@@ -1193,10 +1393,11 @@ export default class Store extends EventEmitter<{
 
     const addedElementIDs: Array<number> = [];
     // This is a mapping of removed ID -> parent ID:
+    // We'll use the parent ID to adjust selection if it gets deleted.
     const removedElementIDs: Map<number, number> = new Map();
     const removedSuspenseIDs: Map<SuspenseNode['id'], SuspenseNode['id']> =
       new Map();
-    // We'll use the parent ID to adjust selection if it gets deleted.
+    let nextActivitySliceID: Element['id'] | null = null;
 
     let i = 2;
 
@@ -1227,11 +1428,12 @@ export default class Store extends EventEmitter<{
       switch (operation) {
         case TREE_OPERATION_ADD: {
           const id = operations[i + 1];
-          const type = ((operations[i + 2]: any): ElementType);
+          const type = operations[i + 2] as any as ElementType;
 
           i += 3;
 
           if (this._idToElement.has(id)) {
+            // We should never reach this. This is a bug in the backend renderer.
             this._throwAndEmitError(
               Error(
                 `Cannot add node "${id}" because a node with that id is already in the Store.`,
@@ -1240,6 +1442,7 @@ export default class Store extends EventEmitter<{
           }
 
           if (type === ElementTypeRoot) {
+            // $FlowFixMe[constant-condition]
             if (__DEBUG__) {
               debug('Add', `new root node ${id}`);
             }
@@ -1300,6 +1503,8 @@ export default class Store extends EventEmitter<{
               id,
               isCollapsed: false, // Never collapse roots; it would hide the entire tree.
               isStrictModeNonCompliant,
+              isActivityHidden: false,
+              isInsideHiddenActivity: false,
               key: null,
               nameProp: null,
               ownerID: 0,
@@ -1329,6 +1534,7 @@ export default class Store extends EventEmitter<{
             const nameProp = stringTable[namePropStringID];
             i++;
 
+            // $FlowFixMe[constant-condition]
             if (__DEBUG__) {
               debug(
                 'Add',
@@ -1338,6 +1544,7 @@ export default class Store extends EventEmitter<{
 
             const parentElement = this._idToElement.get(parentID);
             if (parentElement === undefined) {
+              // We should never reach this. This is a bug in the backend renderer.
               this._throwAndEmitError(
                 Error(
                   `Cannot add child "${id}" to parent "${parentID}" because parent node was not found in the Store.`,
@@ -1369,6 +1576,10 @@ export default class Store extends EventEmitter<{
               id,
               isCollapsed: this._collapseNodesByDefault,
               isStrictModeNonCompliant: parentElement.isStrictModeNonCompliant,
+              isActivityHidden: false,
+              isInsideHiddenActivity:
+                parentElement.isInsideHiddenActivity ||
+                parentElement.isActivityHidden,
               key,
               nameProp,
               ownerID,
@@ -1410,6 +1621,7 @@ export default class Store extends EventEmitter<{
             const element = this._idToElement.get(id);
 
             if (element === undefined) {
+              // We should never reach this. This is a bug in the backend renderer.
               this._throwAndEmitError(
                 Error(
                   `Cannot remove node "${id}" because no matching node was found in the Store.`,
@@ -1423,6 +1635,7 @@ export default class Store extends EventEmitter<{
 
             const {children, ownerID, parentID, weight} = element;
             if (children.length > 0) {
+              // We should never reach this. This is a bug in the backend renderer.
               this._throwAndEmitError(
                 Error(`Node "${id}" was removed before its children.`),
               );
@@ -1432,6 +1645,7 @@ export default class Store extends EventEmitter<{
 
             let parentElement: ?Element = null;
             if (parentID === 0) {
+              // $FlowFixMe[constant-condition]
               if (__DEBUG__) {
                 debug('Remove', `node ${id} root`);
               }
@@ -1442,12 +1656,14 @@ export default class Store extends EventEmitter<{
 
               haveRootsChanged = true;
             } else {
+              // $FlowFixMe[constant-condition]
               if (__DEBUG__) {
                 debug('Remove', `node ${id} from parent ${parentID}`);
               }
 
               parentElement = this._idToElement.get(parentID);
               if (parentElement === undefined) {
+                // We should never reach this. This is a bug in the backend renderer.
                 this._throwAndEmitError(
                   Error(
                     `Cannot remove node "${id}" from parent "${parentID}" because no matching node was found in the Store.`,
@@ -1480,45 +1696,6 @@ export default class Store extends EventEmitter<{
 
           break;
         }
-        case TREE_OPERATION_REMOVE_ROOT: {
-          i += 1;
-
-          const id = operations[1];
-
-          if (__DEBUG__) {
-            debug(`Remove root ${id}`);
-          }
-
-          const recursivelyDeleteElements = (elementID: number) => {
-            const element = this._idToElement.get(elementID);
-            this._idToElement.delete(elementID);
-            if (element) {
-              // Mostly for Flow's sake
-              for (let index = 0; index < element.children.length; index++) {
-                recursivelyDeleteElements(element.children[index]);
-              }
-            }
-          };
-
-          const root = this._idToElement.get(id);
-          if (root === undefined) {
-            this._throwAndEmitError(
-              Error(
-                `Cannot remove root "${id}": no matching node was found in the Store.`,
-              ),
-            );
-
-            break;
-          }
-
-          recursivelyDeleteElements(id);
-
-          this._rootIDToCapabilities.delete(id);
-          this._rootIDToRendererID.delete(id);
-          this._roots = this._roots.filter(rootID => rootID !== id);
-          this._weightAcrossRoots -= root.weight;
-          break;
-        }
         case TREE_OPERATION_REORDER_CHILDREN: {
           const id = operations[i + 1];
           const numChildren = operations[i + 2];
@@ -1526,6 +1703,7 @@ export default class Store extends EventEmitter<{
 
           const element = this._idToElement.get(id);
           if (element === undefined) {
+            // We should never reach this. This is a bug in the backend renderer.
             this._throwAndEmitError(
               Error(
                 `Cannot reorder children for node "${id}" because no matching node was found in the Store.`,
@@ -1537,6 +1715,7 @@ export default class Store extends EventEmitter<{
 
           const children = element.children;
           if (children.length !== numChildren) {
+            // We should never reach this. This is a bug in the backend renderer.
             this._throwAndEmitError(
               Error(
                 `Children cannot be added or removed during a reorder operation.`,
@@ -1559,6 +1738,7 @@ export default class Store extends EventEmitter<{
           }
           i += numChildren;
 
+          // $FlowFixMe[constant-condition]
           if (__DEBUG__) {
             debug('Re-order', `Node ${id} children ${children.join(',')}`);
           }
@@ -1576,8 +1756,45 @@ export default class Store extends EventEmitter<{
             this._recursivelyUpdateSubtree(id, element => {
               element.isStrictModeNonCompliant = false;
             });
+          } else if (mode === ActivityHiddenMode) {
+            const element = this._idToElement.get(id);
+            if (element != null) {
+              element.isActivityHidden = true;
+              element.children.forEach(childID =>
+                this._recursivelyUpdateSubtree(childID, child => {
+                  child.isInsideHiddenActivity = true;
+                }),
+              );
+              // Collapse hidden Activity subtrees by default.
+              if (!element.isCollapsed) {
+                element.isCollapsed = true;
+                if (element.children.length > 0) {
+                  const weightDelta = 1 - element.weight;
+                  const parentElement = this._idToElement.get(element.parentID);
+                  this._adjustParentTreeWeight(parentElement, weightDelta);
+                }
+              }
+            }
+          } else if (mode === ActivityVisibleMode) {
+            const element = this._idToElement.get(id);
+            if (element != null) {
+              element.isActivityHidden = false;
+              element.children.forEach(childID =>
+                this._recursivelyUpdateSubtree(childID, child => {
+                  child.isInsideHiddenActivity = false;
+                }),
+              );
+              // Expand Activity subtree when it becomes visible.
+              if (element.isCollapsed && element.children.length > 0) {
+                element.isCollapsed = false;
+                const weightDelta = element.weight - 1;
+                const parentElement = this._idToElement.get(element.parentID);
+                this._adjustParentTreeWeight(parentElement, weightDelta);
+              }
+            }
           }
 
+          // $FlowFixMe[constant-condition]
           if (__DEBUG__) {
             debug(
               'Subtree mode',
@@ -1612,10 +1829,11 @@ export default class Store extends EventEmitter<{
           const parentID = operations[i + 2];
           const nameStringID = operations[i + 3];
           const isSuspended = operations[i + 4] === 1;
-          const numRects = ((operations[i + 5]: any): number);
+          const numRects = operations[i + 5] as any as number;
           let name = stringTable[nameStringID];
 
           if (this._idToSuspense.has(id)) {
+            // We should never reach this. This is a bug in the backend renderer.
             this._throwAndEmitError(
               Error(
                 `Cannot add suspense node "${id}" because a suspense node with that id is already in the Store.`,
@@ -1660,6 +1878,7 @@ export default class Store extends EventEmitter<{
             }
           }
 
+          // $FlowFixMe[constant-condition]
           if (__DEBUG__) {
             debug('Suspense Add', `node ${id} as child of ${parentID}`);
           }
@@ -1667,6 +1886,7 @@ export default class Store extends EventEmitter<{
           if (parentID !== 0) {
             const parentSuspense = this._idToSuspense.get(parentID);
             if (parentSuspense === undefined) {
+              // We should never reach this. This is a bug in the backend renderer.
               this._throwAndEmitError(
                 Error(
                   `Cannot add suspense child "${id}" to parent suspense "${parentID}" because parent suspense node was not found in the Store.`,
@@ -1688,6 +1908,7 @@ export default class Store extends EventEmitter<{
             hasUniqueSuspenders: false,
             isSuspended: isSuspended,
             environments: [],
+            endTime: 0,
           });
 
           hasSuspenseTreeChanged = true;
@@ -1702,6 +1923,7 @@ export default class Store extends EventEmitter<{
             const suspense = this._idToSuspense.get(id);
 
             if (suspense === undefined) {
+              // We should never reach this. This is a bug in the backend renderer.
               this._throwAndEmitError(
                 Error(
                   `Cannot remove suspense node "${id}" because no matching node was found in the Store.`,
@@ -1715,6 +1937,7 @@ export default class Store extends EventEmitter<{
 
             const {children, parentID, rects} = suspense;
             if (children.length > 0) {
+              // We should never reach this. This is a bug in the backend renderer.
               this._throwAndEmitError(
                 Error(`Suspense node "${id}" was removed before its children.`),
               );
@@ -1732,16 +1955,19 @@ export default class Store extends EventEmitter<{
 
             let parentSuspense: ?SuspenseNode = null;
             if (parentID === 0) {
+              // $FlowFixMe[constant-condition]
               if (__DEBUG__) {
                 debug('Suspense remove', `node ${id} root`);
               }
             } else {
+              // $FlowFixMe[constant-condition]
               if (__DEBUG__) {
                 debug('Suspense Remove', `node ${id} from parent ${parentID}`);
               }
 
               parentSuspense = this._idToSuspense.get(parentID);
               if (parentSuspense === undefined) {
+                // We should never reach this. This is a bug in the backend renderer.
                 this._throwAndEmitError(
                   Error(
                     `Cannot remove suspense node "${id}" from parent "${parentID}" because no matching node was found in the Store.`,
@@ -1752,6 +1978,14 @@ export default class Store extends EventEmitter<{
               }
 
               const index = parentSuspense.children.indexOf(id);
+              if (index === -1) {
+                // We should never reach this. This is a bug in the backend renderer.
+                this._throwAndEmitError(
+                  Error(
+                    `Cannot remove suspense node "${id}" from parent "${parentID}" because it is not a child of the parent.`,
+                  ),
+                );
+              }
               parentSuspense.children.splice(index, 1);
             }
           }
@@ -1766,6 +2000,7 @@ export default class Store extends EventEmitter<{
 
           const suspense = this._idToSuspense.get(id);
           if (suspense === undefined) {
+            // We should never reach this. This is a bug in the backend renderer.
             this._throwAndEmitError(
               Error(
                 `Cannot reorder children for suspense node "${id}" because no matching node was found in the Store.`,
@@ -1777,6 +2012,7 @@ export default class Store extends EventEmitter<{
 
           const children = suspense.children;
           if (children.length !== numChildren) {
+            // We should never reach this. This is a bug in the backend renderer.
             this._throwAndEmitError(
               Error(
                 `Suspense children cannot be added or removed during a reorder operation.`,
@@ -1799,6 +2035,7 @@ export default class Store extends EventEmitter<{
           }
           i += numChildren;
 
+          // $FlowFixMe[constant-condition]
           if (__DEBUG__) {
             debug(
               'Re-order',
@@ -1810,12 +2047,13 @@ export default class Store extends EventEmitter<{
           break;
         }
         case SUSPENSE_TREE_OPERATION_RESIZE: {
-          const id = ((operations[i + 1]: any): number);
-          const numRects = ((operations[i + 2]: any): number);
+          const id = operations[i + 1] as any as number;
+          const numRects = operations[i + 2] as any as number;
           i += 3;
 
           const suspense = this._idToSuspense.get(id);
           if (suspense === undefined) {
+            // We should never reach this. This is a bug in the backend renderer.
             this._throwAndEmitError(
               Error(
                 `Cannot set rects for suspense node "${id}" because no matching node was found in the Store.`,
@@ -1857,6 +2095,7 @@ export default class Store extends EventEmitter<{
 
           suspense.rects = nextRects;
 
+          // $FlowFixMe[constant-condition]
           if (__DEBUG__) {
             debug(
               'Resize',
@@ -1884,6 +2123,7 @@ export default class Store extends EventEmitter<{
           for (let changeIndex = 0; changeIndex < changeLength; changeIndex++) {
             const id = operations[i++];
             const hasUniqueSuspenders = operations[i++] === 1;
+            const endTime = operations[i++] / 1000;
             const isSuspended = operations[i++] === 1;
             const environmentNamesLength = operations[i++];
             const environmentNames = [];
@@ -1901,6 +2141,7 @@ export default class Store extends EventEmitter<{
             const suspense = this._idToSuspense.get(id);
 
             if (suspense === undefined) {
+              // We should never reach this. This is a bug in the backend renderer.
               this._throwAndEmitError(
                 Error(
                   `Cannot update suspenders of suspense node "${id}" because no matching node was found in the Store.`,
@@ -1910,21 +2151,30 @@ export default class Store extends EventEmitter<{
               break;
             }
 
+            // $FlowFixMe[constant-condition]
             if (__DEBUG__) {
               const previousHasUniqueSuspenders = suspense.hasUniqueSuspenders;
               debug(
                 'Suspender changes',
-                `Suspense node ${id} unique suspenders set to ${String(hasUniqueSuspenders)} (was ${String(previousHasUniqueSuspenders)})`,
+                `Suspense node ${id} unique suspenders set to ${String(
+                  hasUniqueSuspenders,
+                )} (was ${String(previousHasUniqueSuspenders)})`,
               );
             }
 
             suspense.hasUniqueSuspenders = hasUniqueSuspenders;
+            suspense.endTime = endTime;
             suspense.isSuspended = isSuspended;
             suspense.environments = environmentNames;
           }
 
           hasSuspenseTreeChanged = true;
 
+          break;
+        }
+        case TREE_OPERATION_APPLIED_ACTIVITY_SLICE_CHANGE: {
+          i++;
+          nextActivitySliceID = operations[i++];
           break;
         }
         default:
@@ -2020,38 +2270,98 @@ export default class Store extends EventEmitter<{
       this.emit('suspenseTreeMutated', [removedSuspenseIDs]);
     }
 
+    // $FlowFixMe[constant-condition]
     if (__DEBUG__) {
       console.log(printStore(this, true));
       console.groupEnd();
     }
 
-    this.emit('mutated', [addedElementIDs, removedElementIDs]);
+    if (nextActivitySliceID !== null && nextActivitySliceID !== 0) {
+      let didCollapse = false;
+      // The backend filtered everything above the Activity slice.
+      // We need to hide everything below the Activity slice by collapsing
+      // the Activities that are descendants of the next Activity slice.
+      const nextActivitySlice = this._idToElement.get(nextActivitySliceID);
+      if (nextActivitySlice === undefined) {
+        throw new Error('Next Activity slice not found in Store.');
+      }
+
+      for (let j = 0; j < nextActivitySlice.children.length; j++) {
+        didCollapse ||= this._collapseActivitiesRecursively(
+          nextActivitySlice.children[j],
+        );
+      }
+
+      if (didCollapse) {
+        let weightAcrossRoots = 0;
+        this._roots.forEach(rootID => {
+          const {weight} = this.getElementByID(rootID) as any as Element;
+          weightAcrossRoots += weight;
+        });
+        this._weightAcrossRoots = weightAcrossRoots;
+      }
+    }
+
+    for (let j = 0; j < this._componentFilters.length; j++) {
+      const filter = this._componentFilters[j];
+      // If we're focusing an Activity, IDs may have changed.
+      if (filter.type === ComponentFilterActivitySlice) {
+        if (nextActivitySliceID === null || nextActivitySliceID === 0) {
+          filter.isValid = false;
+        } else {
+          filter.activityID = nextActivitySliceID;
+        }
+      }
+    }
+
+    if (nextActivitySliceID !== null) {
+      this._focusedTransition = nextActivitySliceID;
+    }
+
+    this.emit('mutated', [
+      addedElementIDs,
+      removedElementIDs,
+      nextActivitySliceID,
+    ]);
   };
 
-  // Certain backends save filters on a per-domain basis.
-  // In order to prevent filter preferences and applied filters from being out of sync,
-  // this message enables the backend to override the frontend's current ("saved") filters.
-  // This action should also override the saved filters too,
-  // else reloading the frontend without reloading the backend would leave things out of sync.
-  onBridgeOverrideComponentFilters: (
-    componentFilters: Array<ComponentFilter>,
-  ) => void = componentFilters => {
-    this._componentFilters = componentFilters;
+  _collapseActivitiesRecursively(elementID: number): boolean {
+    let didMutate = false;
+    const element = this._idToElement.get(elementID);
+    if (element === undefined) {
+      throw new Error('Element not found in Store.');
+    }
 
-    setSavedComponentFilters(componentFilters);
-  };
+    if (element.type === ElementTypeActivity) {
+      if (!element.isCollapsed) {
+        element.isCollapsed = true;
+
+        const weightDelta = 1 - element.weight;
+
+        let parentElement = this._idToElement.get(element.parentID);
+        while (parentElement !== undefined) {
+          parentElement.weight += weightDelta;
+          parentElement = this._idToElement.get(parentElement.parentID);
+        }
+        return true;
+      }
+      return false;
+    }
+
+    for (let i = 0; i < element.children.length; i++) {
+      didMutate ||= this._collapseActivitiesRecursively(element.children[i]);
+    }
+    return didMutate;
+  }
 
   onBridgeShutdown: () => void = () => {
+    // $FlowFixMe[constant-condition]
     if (__DEBUG__) {
       debug('onBridgeShutdown', 'unsubscribing from Bridge');
     }
 
     const bridge = this._bridge;
     bridge.removeListener('operations', this.onBridgeOperations);
-    bridge.removeListener(
-      'overrideComponentFilters',
-      this.onBridgeOverrideComponentFilters,
-    );
     bridge.removeListener('shutdown', this.onBridgeShutdown);
     bridge.removeListener(
       'isReloadAndProfileSupportedByBackend',
@@ -2145,8 +2455,15 @@ export default class Store extends EventEmitter<{
     this._bridge.send('getHookSettings'); // Warm up cached hook settings
   };
 
-  onHostInstanceSelected: (elementId: number) => void = elementId => {
-    if (this._lastSelectedHostInstanceElementId === elementId) {
+  onHostInstanceSelected: (elementId: number | null) => void = elementId => {
+    if (
+      this._lastSelectedHostInstanceElementId === elementId &&
+      // Force clear selection e.g. when we inspect an element in the Components panel
+      // and then switch to the browser's Elements panel.
+      // We wouldn't want to stay on the inspected element if we're inspecting
+      // an element not owned by React when switching to the browser's Elements panel.
+      elementId !== null
+    ) {
       return;
     }
 
@@ -2176,7 +2493,7 @@ export default class Store extends EventEmitter<{
       this._hookSettings = settings;
 
       this._bridge.send('updateHookSettings', settings);
-      this.emit('settingsUpdated', settings);
+      this.emit('settingsUpdated', settings, this._componentFilters);
     };
 
   onHookSettings: (settings: $ReadOnly<DevToolsHookSettings>) => void =
@@ -2193,18 +2510,9 @@ export default class Store extends EventEmitter<{
 
     if (previousStatus !== status) {
       // Propagate to subscribers, although tree state has not changed
-      this.emit('mutated', [[], new Map()]);
+      this.emit('mutated', [[], new Map(), null]);
     }
   }
-
-  get supportsSuspenseTab(): boolean {
-    return this._supportsSuspenseTab;
-  }
-
-  onEnableSuspenseTab = (): void => {
-    this._supportsSuspenseTab = true;
-    this.emit('enableSuspenseTab');
-  };
 
   // The Store should never throw an Error without also emitting an event.
   // Otherwise Store errors will be invisible to users,
