@@ -1,6 +1,10 @@
 # `eslint-plugin-react-hooks`
 
-The official ESLint plugin for [React](https://react.dev) which enforces the [Rules of React](https://react.dev/reference/eslint-plugin-react-hooks) and other best practices.
+* == ESLint plugin -- for -- React
+  * official 
+  * enforces the
+    * [Rules of React](https://react.dev/reference/eslint-plugin-react-hooks) 
+    * OTHER BEST practices
 
 ## Installation
 
@@ -143,8 +147,5 @@ We suggest to use this option **very sparingly, if at all**. Generally saying, w
 
 ## Valid and Invalid Examples
 
-Please refer to the [Rules of Hooks](https://react.dev/reference/rules/rules-of-hooks) documentation to learn more about this rule.
+* [Rules of Hooks](https://react.dev/reference/rules/rules-of-hooks)
 
-## License
-
-MIT
