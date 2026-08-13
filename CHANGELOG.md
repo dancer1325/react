@@ -284,7 +284,32 @@ Below is a list of all new features, APIs, deprecations, and breaking changes. R
 
 #### React Server Components
 
-* RSC features such as directives, server components, and server functions are now stable. This means libraries that ship with Server Components can now target React 19 as a peer dependency with a react-server export condition for use in frameworks that support the Full-stack React Architecture. The underlying APIs used to implement a React Server Components bundler or framework do not follow semver and may break between minors in React 19.x. See [docs](https://19.react.dev/reference/rsc/server-components) for how to support React Server Components.
+* RSC features
+  * _Example:_ directives, server components, and server functions 
+  * 💡NOW, stable💡
+    * == libraries can ship with Server Components
+      * == use React v19 -- as -- peer dependency
+      * requirements
+        * | "package.json", 
+
+          ```json
+          {
+            "exports": {
+              "react-server": "./server.js",
+              "default": "./client.js"
+            }
+          }
+          ```
+
+* RSC' underlying APIs
+  * uses
+    * implement a 
+      * RSC bundler
+      * RSC framework
+  * ❌NOT follow semver❌
+    * == may break BETWEEN minors | React 19.x
+
+* [doc](docs/reference/rsc/server-components)
 
 ### Deprecations
 

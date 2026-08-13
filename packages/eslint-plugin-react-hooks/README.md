@@ -8,20 +8,30 @@
 
 ## Installation
 
-Assuming you already have ESLint installed, run:
+* install ESLint
+* run
 
-```sh
-# npm
-npm install eslint-plugin-react-hooks --save-dev
+  ```sh
+  # npm
+  npm install eslint-plugin-react-hooks --save-dev
+  
+  # yarn
+  yarn add eslint-plugin-react-hooks --dev
+  ```
+* configure
+  * [flat configuration -- "eslint.config.js|ts" --](#flat-configuration----eslintconfigjsts---)
+  * [legacy configuration -- ".eslintrc" --](#legacy-configuration----eslintrc---)
+  * [custom configurations](#custom-configuration)
+  * [advanced configurations](#advanced-configuration)
 
-# yarn
-yarn add eslint-plugin-react-hooks --dev
-```
+## configurations
 
-### Flat Config (eslint.config.js|ts)
+### flat configuration -- "eslint.config.js|ts" --
 
-Add the `recommended` config for all recommended rules:
+* | ALL recommended rules,
+  * add the `recommended` config 
 
+TODO: 
 ```js
 // eslint.config.js
 import reactHooks from 'eslint-plugin-react-hooks';
@@ -44,7 +54,7 @@ export default defineConfig([
 ]);
 ```
 
-### Legacy Config (.eslintrc)
+### legacy configuration -- ".eslintrc" --
 
 If you are still using ESLint below 9.0.0, the `recommended` preset can also be used to enable all recommended rules.
 
@@ -56,7 +66,7 @@ If you are still using ESLint below 9.0.0, the `recommended` preset can also be 
 
 ```
 
-### Custom Configuration
+### custom Configuration
 
 If you want more fine-grained configuration, you can instead choose to enable specific rules. However, we strongly encourage using the recommended presets — see above — so that you will automatically receive new recommended rules as we add them in future versions of the plugin.
 
@@ -127,7 +137,7 @@ export default [
 }
 ```
 
-## Advanced Configuration
+### advanced configuration
 
 `exhaustive-deps` can be configured to validate dependencies of custom Hooks with the `additionalHooks` option.
 This option accepts a regex to match the names of custom Hooks that have dependencies.
